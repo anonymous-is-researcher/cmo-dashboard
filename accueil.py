@@ -3,10 +3,7 @@ import pandas as pd
 from sqlalchemy import create_engine
 import plotly.express as px
 
-# Auth check
 
-
-# DB connection
 db_user = st.secrets["POSTGRES_USER"]
 db_pwd = st.secrets["POSTGRES_PASSWORD"]
 db_name = st.secrets["POSTGRES_DB"]
@@ -15,160 +12,145 @@ db_port = st.secrets["POSTGRES_PORT"]
 
 engine = create_engine(f"postgresql://{db_user}:{db_pwd}@{db_host}:{db_port}/{db_name}")
 
-# Page
-st.set_page_config(page_title="CoffeeGo - CMO Dashboard", layout="wide")
-st.title("📈 CoffeeGo — CMO Dashboard")
+st.set_page_config(page_title="CoffeeGo - COO Dashboard", layout="wide")
+st.title("🚚 CoffeeGo — COO Dashboard")
 
 # Year selection
 year = st.selectbox("📅 Select Year", options=[2022, 2023, 2024], index=2)
 
-# --- Revenue by channel ---
-df_ca_canal = pd.read_sql(
+# --- TOP KPIs ---
+
+# Total deliveries
+total_deliv = pd.read_sql(
+    "SELECT COUNT(*) AS nb FROM f_deliveries d JOIN dim_time t ON d.id_time = t.id_time WHERE t.year = %(year)s",
+    engine, params={"year": year}
+)['nb'][0] or 1
+
+# Avg delivery time
+mean_delay = pd.read_sql(
+    "SELECT AVG(delivery_time) AS mean_delay FROM f_deliveries d JOIN dim_time t ON d.id_time = t.id_time WHERE t.year = %(year)s",
+    engine, params={"year": year}
+)['mean_delay'][0] or 0
+
+# Delivery status
+df_deliv_status = pd.read_sql(
+    "SELECT status, COUNT(*) AS nb FROM f_deliveries d JOIN dim_time t ON d.id_time = t.id_time WHERE t.year = %(year)s GROUP BY status",
+    engine, params={"year": year}
+)
+nb_ontime = df_deliv_status[df_deliv_status["status"]=="delivered_on_time"]["nb"].sum() if "delivered_on_time" in df_deliv_status["status"].values else 0
+nb_delayed = df_deliv_status[df_deliv_status["status"]=="delayed"]["nb"].sum() if "delayed" in df_deliv_status["status"].values else 0
+nb_inprog = df_deliv_status[df_deliv_status["status"]=="in_progress"]["nb"].sum() if "in_progress" in df_deliv_status["status"].values else 0
+
+pct_ontime = 100 * nb_ontime / total_deliv if total_deliv > 0 else 0
+pct_delayed = 100 * nb_delayed / total_deliv if total_deliv > 0 else 0
+pct_inprog = 100 * nb_inprog / total_deliv if total_deliv > 0 else 0
+
+# Stock shortages
+df_shortages = pd.read_sql(
+    "SELECT SUM(shortages) AS shortages, SUM(niveau_stock) AS stock_total FROM f_stock s JOIN dim_time t ON s.id_time = t.id_time WHERE t.year = %(year)s",
+    engine, params={"year": year}
+)
+shortages = df_shortages["shortages"][0] or 0
+stock_total = df_shortages["stock_total"][0] or 1
+pct_shortage = 100 * shortages / stock_total if stock_total > 0 else 0
+
+# Stock value
+valeur_stock = pd.read_sql(
+    "SELECT SUM(s.niveau_stock * p.cost) AS valeur_stock FROM f_stock s JOIN dim_product p ON s.id_product = p.id_product JOIN dim_time t ON s.id_time = t.id_time WHERE t.year = %(year)s",
+    engine, params={"year": year}
+)['valeur_stock'][0] or 0
+
+# KPI HEADER
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Total Deliveries", f"{total_deliv:,}", help="Number of delivery operations completed.")
+col2.metric("Avg. Delivery Time (days)", f"{mean_delay:.2f}", help="Average number of days per delivery.")
+col3.metric("On-time Deliveries (%)", f"{pct_ontime:.1f}", help="Deliveries marked as 'delivered_on_time' over total deliveries.")
+col4.metric("Delayed Deliveries (%)", f"{pct_delayed:.1f}", help="Deliveries marked as 'delayed' over total deliveries.")
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Deliveries In Progress (%)", f"{pct_inprog:.1f}", help="Deliveries currently in progress.")
+col2.metric("Stock Shortage Rate (%)", f"{pct_shortage:.2f}", help="Shortage units over total stock units.")
+col3.metric("Total Stock Value (€)", f"{valeur_stock:,.0f}", help="Total stock value calculated from stock quantities and product costs.")
+
+# --- Monthly Stock ---
+st.subheader("📦 Monthly Stock per Product")
+df_stock_month = pd.read_sql(
     """
-    SELECT c.canal_name, SUM(s.amount) AS ca_sales, COUNT(DISTINCT s.id_client) AS nb_clients
-    FROM f_sales s
-    JOIN dim_canal c ON s.id_canal = c.id_canal
+    SELECT t.month, p.product_name, SUM(s.niveau_stock) AS stock
+    FROM f_stock s
     JOIN dim_time t ON s.id_time = t.id_time
+    JOIN dim_product p ON s.id_product = p.id_product
     WHERE t.year = %(year)s
-    GROUP BY c.canal_name
-    ORDER BY ca_sales DESC
+    GROUP BY t.month, p.product_name
+    ORDER BY t.month, p.product_name
     """, engine, params={"year": year}
 )
-st.subheader("Revenue & Clients by Channel")
-fig1 = px.bar(df_ca_canal, x="canal_name", y="ca_sales", title="Sales Revenue by Channel", text_auto=".2s")
-st.plotly_chart(fig1, use_container_width=True)
-st.dataframe(df_ca_canal.rename(columns={"canal_name":"Channel","ca_sales":"Revenue (€)","nb_clients":"Nb Clients"}))
+fig_stock = px.bar(
+    df_stock_month, x="month", y="stock", color="product_name",
+    title="Monthly Stock Level per Product", barmode="group"
+)
+st.plotly_chart(fig_stock, use_container_width=True)
 
-# --- Revenue by product ---
-st.subheader("Revenue Share by Product")
-
-ca_total = pd.read_sql(
+# --- Monthly Shortages ---
+df_shortages_month = pd.read_sql(
     """
-    SELECT SUM(amount) AS ca_total
-    FROM f_sales s
+    SELECT t.month, SUM(s.shortages) AS shortages
+    FROM f_stock s
     JOIN dim_time t ON s.id_time = t.id_time
     WHERE t.year = %(year)s
+    GROUP BY t.month
+    ORDER BY t.month
     """, engine, params={"year": year}
-)['ca_total'][0] or 0
+)
+fig_short = px.bar(df_shortages_month, x="month", y="shortages", title="Monthly Stock Shortages")
+st.plotly_chart(fig_short, use_container_width=True)
 
-df_ca_prod = pd.read_sql(
+# --- Deliveries per Month and Status ---
+st.subheader("🚛 Deliveries per Month and Status")
+df_liv = pd.read_sql(
     """
-    SELECT p.product_name, SUM(s.amount) AS ca_produit
-    FROM f_sales s
-    JOIN dim_product p ON s.id_product = p.id_product
-    JOIN dim_time t ON s.id_time = t.id_time
+    SELECT t.month, d.status, COUNT(*) AS nb_deliveries
+    FROM f_deliveries d
+    JOIN dim_time t ON d.id_time = t.id_time
+    WHERE t.year = %(year)s
+    GROUP BY t.month, d.status
+    ORDER BY t.month, d.status
+    """, engine, params={"year": year}
+)
+fig_liv = px.bar(df_liv, x="month", y="nb_deliveries", color="status", barmode="group", title="Monthly Deliveries by Status")
+st.plotly_chart(fig_liv, use_container_width=True)
+
+# --- Deliveries by City ---
+st.subheader("🌍 Deliveries by City")
+df_volume_city = pd.read_sql(
+    """
+    SELECT pl.city, COUNT(*) AS nb_livraisons
+    FROM f_deliveries d
+    JOIN dim_place pl ON d.id_place = pl.id_place
+    JOIN dim_time t ON d.id_time = t.id_time
+    WHERE t.year = %(year)s
+    GROUP BY pl.city
+    ORDER BY nb_livraisons DESC
+    """, engine, params={"year": year}
+)
+fig_city = px.bar(df_volume_city, x="city", y="nb_livraisons", title="Number of Deliveries per City")
+st.plotly_chart(fig_city, use_container_width=True)
+
+# --- Deliveries per Product ---
+st.subheader("📦 Deliveries per Product")
+df_liv_prod = pd.read_sql(
+    """
+    SELECT p.product_name, COUNT(*) AS nb_liv
+    FROM f_deliveries d
+    JOIN dim_product p ON d.id_product = p.id_product
+    JOIN dim_time t ON d.id_time = t.id_time
     WHERE t.year = %(year)s
     GROUP BY p.product_name
-    ORDER BY ca_produit DESC
+    ORDER BY nb_liv DESC
     """, engine, params={"year": year}
 )
-
-df_ca_prod["pct_CA"] = 100 * df_ca_prod["ca_produit"] / ca_total if ca_total > 0 else 0
-fig_prod = px.pie(df_ca_prod, names="product_name", values="ca_produit", title="Revenue Share by Product", hole=0.3)
-st.plotly_chart(fig_prod, use_container_width=True)
-
-# --- Geographic origin of clients ---
-st.subheader("Geographic Distribution of Clients")
-df_client_location = pd.read_sql(
-    """
-    SELECT location, COUNT(*) AS nb_clients
-    FROM dim_client
-    GROUP BY location
-    ORDER BY nb_clients DESC
-    LIMIT 15
-    """, engine
-)
-fig_geo = px.bar(df_client_location, x="location", y="nb_clients", title="Top Cities of Clients", text_auto=True)
-st.plotly_chart(fig_geo, use_container_width=True)
-
-# --- Client acquisition by channel ---
-st.subheader("Client Acquisition by Channel")
-df_client_origin = pd.read_sql(
-    """
-    SELECT d.canal_name, COUNT(DISTINCT a.id_client) AS nb_clients
-    FROM f_abonnement a
-    JOIN dim_time t ON a.id_time = t.id_time
-    JOIN dim_canal d ON a.id_canal = d.id_canal
-    WHERE t.year = %(year)s
-    GROUP BY d.canal_name
-    ORDER BY nb_clients DESC
-    """, engine, params={"year": year}
-)
-fig_origin = px.bar(df_client_origin, x="canal_name", y="nb_clients", title="Clients Acquired by Channel", text_auto=True)
-st.plotly_chart(fig_origin, use_container_width=True)
-
-# --- Campaign conversions & CAC ---
-df_ca_camp = pd.read_sql(
-    """
-    SELECT d.name AS campaign, SUM(f.conversions) AS conversions, SUM(f.cac) AS total_cac
-    FROM f_campagnemarketing f
-    JOIN dim_campaign d ON f.id_campaign = d.id_campaign
-    JOIN dim_time t ON f.id_time = t.id_time
-    WHERE t.year = %(year)s
-    GROUP BY d.name
-    ORDER BY conversions DESC
-    """, engine, params={"year": year}
-)
-st.subheader("Campaign Conversions & Total CAC")
-fig2 = px.bar(df_ca_camp, x="campaign", y="conversions", title="Conversions per Campaign", text_auto=True)
-st.plotly_chart(fig2, use_container_width=True)
-st.dataframe(df_ca_camp.rename(columns={"campaign":"Campaign","conversions":"Conversions","total_cac":"Total CAC (€)"}))
-
-# --- CAC by channel ---
-df_cac_canal = pd.read_sql(
-    """
-    SELECT c.canal_name, AVG(f.cac) AS avg_cac
-    FROM f_campagnemarketing f
-    JOIN dim_canal c ON f.id_canal = c.id_canal
-    JOIN dim_time t ON f.id_time = t.id_time
-    WHERE t.year = %(year)s
-    GROUP BY c.canal_name
-    """, engine, params={"year": year}
-)
-avg_cac_global = df_cac_canal["avg_cac"].mean() if not df_cac_canal.empty else 0
-
-col1, col2 = st.columns(2)
-col1.metric("Average Global CAC (€)", f"{avg_cac_global:.2f}", help="Average Customer Acquisition Cost across all channels.")
-if not df_cac_canal.empty:
-    col2.metric("Most Efficient Channel (CAC)", df_cac_canal.sort_values("avg_cac").iloc[0]["canal_name"])
-
-fig3 = px.bar(df_cac_canal, x="canal_name", y="avg_cac", title="Average CAC per Channel", text_auto=".2f")
-st.plotly_chart(fig3, use_container_width=True)
-
-# --- NPS by channel ---
-st.subheader("NPS per Channel")
-df_nps_canal = pd.read_sql(
-    """
-    SELECT c.canal_name, AVG(cs.NPS) AS nps
-    FROM f_clientsatisfaction cs
-    JOIN dim_canal c ON cs.id_canal = c.id_canal
-    JOIN dim_time t ON cs.id_time = t.id_time
-    WHERE t.year = %(year)s
-    GROUP BY c.canal_name
-    """, engine, params={"year": year}
-)
-fig6 = px.bar(df_nps_canal, x="canal_name", y="nps", title="NPS by Channel", text_auto=".1f")
-st.plotly_chart(fig6, use_container_width=True)
-
-# --- Subscriber retention cohort ---
-st.subheader("Subscriber Retention Cohort")
-df_cohorte = pd.read_sql(
-    """
-    SELECT dt.month AS mois_start, COUNT(DISTINCT a.id_client) AS nb_nouveaux,
-           SUM(CASE WHEN a.state = 'active' THEN 1 ELSE 0 END) AS nb_retenus
-    FROM f_abonnement a
-    JOIN dim_time dt ON a.id_time = dt.id_time
-    WHERE dt.year = %(year)s
-    GROUP BY dt.month ORDER BY dt.month
-    """, engine, params={"year": year}
-)
-if not df_cohorte.empty:
-    df_cohorte["Retention (%)"] = 100 * df_cohorte["nb_retenus"] / df_cohorte["nb_nouveaux"]
-    fig_cohort = px.line(df_cohorte, x="mois_start", y="Retention (%)", title="Monthly Subscriber Retention Rate", markers=True)
-    st.plotly_chart(fig_cohort, use_container_width=True)
-    st.dataframe(df_cohorte.rename(columns={"mois_start":"Start Month", "nb_nouveaux":"New Subscribers", "nb_retenus":"Retained Subscribers", "Retention (%)":"Retention (%)"}))
-else:
-    st.info("No cohort data available for the selected year.")
+fig_liv_prod = px.bar(df_liv_prod, x="product_name", y="nb_liv", title="Deliveries per Product")
+st.plotly_chart(fig_liv_prod, use_container_width=True)
 
 # Footer
-st.caption("CMO Dashboard — CoffeeGo DSS Simulation ©️")
+st.caption("COO Dashboard — CoffeeGo DSS Simulation ©️")
